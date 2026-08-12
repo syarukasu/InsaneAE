@@ -16,7 +16,6 @@ import appeng.util.inv.filter.IAEItemFilter;
 import com.mojang.logging.LogUtils;
 import jp.main.taikun.insaneae.mixin.PatternProviderLogicAccessor;
 import jp.main.taikun.insaneae.provider.InsanePatternProviderLogic;
-import jp.main.taikun.insaneae.upgrade.SpeedBoost;
 import net.minecraft.core.NonNullList;
 import net.minecraft.world.inventory.CraftingContainer;
 import net.minecraft.world.inventory.TransientCraftingContainer;
@@ -28,6 +27,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.math.BigInteger;
 
 /**
  * Quantum CPU の頭脳。パターンプロバイダのロジックをそのまま使いつつ、
@@ -216,13 +216,16 @@ public class QuantumCpuLogic extends InsanePatternProviderLogic implements IBulk
             return 0;
         }
 
+        KeyCounter[] originalInputs = copyInputHolder(inputHolder);
         fillGrid(pattern, inputHolder, Leftovers.KEEP);
 
         Assembly assembly = resolveAssembly(details, pattern, level);
         if (assembly == null) {
-            // 組めなかった。グリッドに載せた 1 回ぶんはネットワークへ返し、
-            // 残りは inputHolder に残したまま返す (呼び出し側が CPU の在庫へ戻す)。
-            returnGridToNetwork();
+            // 組立失敗時はpushPatternBulkの外側が材料を戻すため、ここでは
+            // inputHolderを呼出し前の状態へ戻し、グリッドを空にする。
+            // 一部だけをネットワークへ返すと、外側のRollbackと二重計上になる。
+            restoreInputHolder(inputHolder, originalInputs);
+            clearCraftingGrid();
             return 0;
         }
 
@@ -240,12 +243,19 @@ public class QuantumCpuLogic extends InsanePatternProviderLogic implements IBulk
     /** 完成品と端材を {@code times} 回ぶん貯める。 */
     private void storeOutputs(Assembly assembly, long times) {
         ItemStack output = assembly.output();
-        host.addPendingOutput(AEItemKey.of(output),
-                SpeedBoost.saturatingMultiply(times, output.getCount()));
+        // 掛け算結果をlongへ戻さない。ここがBigInteger会計へ入る唯一の出力境界。
+        BigInteger count = BigInteger.valueOf(times).multiply(BigInteger.valueOf(output.getCount()));
+        host.addPendingOutput(AEItemKey.of(output), count);
         for (ItemStack remainder : assembly.remainders()) {
-            host.addPendingOutput(AEItemKey.of(remainder),
-                    SpeedBoost.saturatingMultiply(times, remainder.getCount()));
+            BigInteger remainderCount = BigInteger.valueOf(times)
+                    .multiply(BigInteger.valueOf(remainder.getCount()));
+            host.addPendingOutput(AEItemKey.of(remainder), remainderCount);
         }
+    }
+
+    @Override
+    public boolean fusesOperations() {
+        return host.isTaskFusionInstalled();
     }
 
     /**
@@ -384,6 +394,31 @@ public class QuantumCpuLogic extends InsanePatternProviderLogic implements IBulk
                 }
                 craftingInv.setItem(slot, ItemStack.EMPTY);
             }
+        }
+    }
+
+    /** まとめ処理失敗時に、fillCraftingGrid前の入力所有量を複製する。 */
+    private static KeyCounter[] copyInputHolder(KeyCounter[] inputHolder) {
+        KeyCounter[] copy = new KeyCounter[inputHolder.length];
+        for (int index = 0; index < inputHolder.length; index++) {
+            copy[index] = new KeyCounter();
+            copy[index].addAll(inputHolder[index]);
+        }
+        return copy;
+    }
+
+    /** 呼出し前の入力へ戻し、BulkCraftingHook側のRollbackへ所有権を返す。 */
+    private static void restoreInputHolder(KeyCounter[] inputHolder, KeyCounter[] originalInputs) {
+        for (int index = 0; index < inputHolder.length; index++) {
+            inputHolder[index].reset();
+            inputHolder[index].addAll(originalInputs[index]);
+        }
+    }
+
+    /** 組立失敗後に、次のPatternへ残った材料を誤流用しない。 */
+    private void clearCraftingGrid() {
+        for (int slot = 0; slot < GRID_SLOTS; slot++) {
+            craftingInv.setItem(slot, ItemStack.EMPTY);
         }
     }
 }

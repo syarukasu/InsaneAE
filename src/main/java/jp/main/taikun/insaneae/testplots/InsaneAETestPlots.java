@@ -26,6 +26,7 @@ import jp.main.taikun.insaneae.quantum.CraftingJobView;
 import jp.main.taikun.insaneae.quantum.QuantumCpuBlockEntity;
 import jp.main.taikun.insaneae.registries.ModBlocks;
 import jp.main.taikun.insaneae.registries.ModCells;
+import jp.main.taikun.insaneae.registries.ModUpgrades;
 import net.minecraft.core.BlockPos;
 import net.minecraft.gametest.framework.GameTestAssertException;
 import net.minecraft.world.item.ItemStack;
@@ -346,6 +347,216 @@ public final class InsaneAETestPlots {
     }
 
     /**
+     * <b>AE2 を複製した他 Mod のクラフト CPU</b> でもまとめ処理が使えることを確かめる
+     * (Issue #2 の回帰テスト)。
+     *
+     * <p>Advanced AE (1.3.6 / 1.6.12 で確認) は {@code ExecutingCraftingJob} だけでなく
+     * 進捗カウンタ {@code ElapsedTimeTracker} まで<b>自前のコピー</b>で持っている。
+     * 以前は「timeTracker フィールドの型が AE2 の tracker であること」を要求していたため、
+     * ここで弾かれてまとめ処理が丸ごと諦めになっていた (1 クラフトずつの遅い経路に落ちる)。</p>
+     *
+     * <p>AAE を dev 環境に入れられないので、<b>同じフィールド構造のフェイク CPU</b>
+     * ({@link FakeForeignCpuLogic}: job / inventory / tasks / waitingFor /
+     * 自前型の timeTracker / markDirty()) を {@code ReflectiveCraftingJobView} に食わせて、
+     * 受理される・まとめ処理が走る・カウンタも呼ばれることを見る。</p>
+     */
+    @TestPlot("insaneae_bulk_foreign_cpu")
+    public static void bulkForeignCpu(PlotBuilder plot) {
+        plot.creativeEnergyCell("0 -1 0");
+        plot.cable("[0,2] 0 0");
+        plot.blockState("2 0 0", ModBlocks.QUANTUM_CPU.get().defaultBlockState());
+
+        final int logsInStock = 5;
+        final int planksPerCraft = 4;
+        final long requested = 1000;
+
+        plot.test(helper -> {
+            var sequence = helper.startSequence();
+
+            sequence.thenExecute(() -> {
+                var cpu = (QuantumCpuBlockEntity) helper.getBlockEntity(new BlockPos(2, 0, 0));
+                cpu.getLogic().getPatternInv().addItems(
+                        CraftingPatternHelper.encodeShapelessCraftingRecipe(helper.getLevel(),
+                                new ItemStack(Items.OAK_LOG)));
+            });
+
+            sequence.thenIdle(5);
+
+            sequence.thenExecute(() -> {
+                var cpu = (QuantumCpuBlockEntity) helper.getBlockEntity(new BlockPos(2, 0, 0));
+                var patterns = cpu.getLogic().getAvailablePatterns();
+                helper.check(patterns.size() == 1, "パターンが 1 枚になっていない");
+
+                // 自前型カウンタが直接呼べること (AAE の addMaxItems はパッケージプライベート)
+                var tracker = new ForeignTimeTracker();
+                jp.main.taikun.insaneae.quantum.TimeTrackerAdapter.addMaxItems(
+                        tracker, 7, AEKeyType.items());
+                helper.check(tracker.max == 7,
+                        "自前型カウンタへの加算が効いていない: " + tracker.max);
+
+                // AAE と同じフィールド構造のフェイク CPU がレイアウト検査を通ること
+                var logic = new FakeForeignCpuLogic();
+                logic.job.tasks.put(patterns.get(0), new ForeignTaskProgress(requested));
+                logic.inventory.insert(AEItemKey.of(Items.OAK_LOG), logsInStock,
+                        appeng.api.config.Actionable.MODULATE);
+
+                var view = jp.main.taikun.insaneae.quantum.ReflectiveCraftingJobView.of(logic);
+                helper.check(view != null,
+                        "自前カウンタ型を持つ CPU がレイアウト検査で弾かれた (Issue #2 の再発)");
+
+                var grid = helper.getGrid(BlockPos.ZERO);
+                int pushed = jp.main.taikun.insaneae.quantum.QuantumBulkCrafting.execute(
+                        view, (int) requested,
+                        (appeng.me.service.CraftingService) grid.getCraftingService(),
+                        grid.getEnergyService(), grid.getPivot().getLevel());
+
+                helper.check(pushed == logsInStock,
+                        "まとめ処理が期待回数走らない: " + pushed);
+                long planks = logic.job.waitingFor.list.get(AEItemKey.of(Items.OAK_PLANKS));
+                helper.check(planks == (long) logsInStock * planksPerCraft,
+                        "完成待ちの数が合わない: " + planks);
+                helper.check(logic.dirty, "markDirty が呼ばれていない");
+            });
+
+            sequence.thenSucceed();
+        });
+    }
+
+    /** AAE の自前 ElapsedTimeTracker に相当。addMaxItems はパッケージプライベート (本物と同じ)。 */
+    private static final class ForeignTimeTracker {
+        long max;
+
+        void addMaxItems(long amount, AEKeyType type) {
+            max += amount;
+        }
+    }
+
+    /** AE2 の TaskProgress に相当 (long の value フィールドだけが要る)。 */
+    private static final class ForeignTaskProgress {
+        long value;
+
+        ForeignTaskProgress(long value) {
+            this.value = value;
+        }
+    }
+
+    /** AAE の ExecutingCraftingJob に相当するフィールド構造。 */
+    private static final class ForeignExecutingJob {
+        final Map<appeng.api.crafting.IPatternDetails, ForeignTaskProgress> tasks = new HashMap<>();
+        final appeng.crafting.inv.ListCraftingInventory waitingFor =
+                new appeng.crafting.inv.ListCraftingInventory(what -> {
+                });
+        final ForeignTimeTracker timeTracker = new ForeignTimeTracker();
+    }
+
+    /** AAE の AdvCraftingCPULogic に相当するフィールド構造。 */
+    private static final class FakeForeignCpuLogic {
+        final ForeignExecutingJob job = new ForeignExecutingJob();
+        final appeng.crafting.inv.ListCraftingInventory inventory =
+                new appeng.crafting.inv.ListCraftingInventory(what -> {
+                });
+        boolean dirty;
+
+        public void markDirty() {
+            dirty = true;
+        }
+    }
+
+    /**
+     * 完成品待ち台帳の BigInteger 会計 (PR #3) の回帰テスト。
+     *
+     * <ol>
+     *   <li>long を超える量を積んでも欠けない (クランプ・折り返しが無い)</li>
+     *   <li>NBT の保存 → 読み込みで量が 1 個もずれない</li>
+     *   <li>壊れたエントリ (解決できないキー・負の量・空の量) は<b>例外を投げず</b>
+     *       そのエントリだけ捨てる — Mod を抜いたらチャンクが壊れる、が最悪の後退なので</li>
+     *   <li>旧 (long 形式) の NBT から移行できる</li>
+     *   <li>ネットワークに入り切らないぶんは serverTick 後も台帳に正確に残る</li>
+     * </ol>
+     */
+    @TestPlot("insaneae_bigint_pending_outputs")
+    public static void bigintPendingOutputs(PlotBuilder plot) {
+        plot.creativeEnergyCell("0 -1 0");
+        plot.cable("0 0 0");
+        plot.blockState("1 0 0", ModBlocks.QUANTUM_CPU.get().defaultBlockState());
+
+        // Long.MAX_VALUE + 5。long のどこにも収まらない代表値。
+        final java.math.BigInteger overLong =
+                java.math.BigInteger.valueOf(Long.MAX_VALUE).add(java.math.BigInteger.valueOf(5));
+        final AEItemKey log = AEItemKey.of(Items.OAK_LOG);
+
+        plot.test(helper -> {
+            var sequence = helper.startSequence();
+
+            sequence.thenExecute(() -> {
+                var cpu = (QuantumCpuBlockEntity) helper.getBlockEntity(new BlockPos(1, 0, 0));
+
+                // 1) long 超の量が正確に載る
+                cpu.addPendingOutput(log, overLong);
+                helper.check(overLong.equals(cpu.getPendingOutputs().get(log)),
+                        "long 超の量が正確に積まれていない: " + cpu.getPendingOutputs().get(log));
+
+                // 2) NBT 往復で 1 個もずれない
+                var tag = new net.minecraft.nbt.CompoundTag();
+                cpu.saveAdditional(tag);
+                cpu.loadTag(tag);
+                helper.check(overLong.equals(cpu.getPendingOutputs().get(log)),
+                        "NBT 往復で量がずれた: " + cpu.getPendingOutputs().get(log));
+
+                // 3) 壊れたエントリは例外なしで捨てられ、正常なエントリは残る
+                var broken = tag.copy();
+                var entries = broken.getCompound("pendingOutputsBig")
+                        .getList("entries", net.minecraft.nbt.Tag.TAG_COMPOUND);
+                var badKey = entries.getCompound(0).copy();
+                badKey.getCompound("key").putString("id", "nomod:removed_item");
+                entries.add(badKey);
+                var badAmount = entries.getCompound(0).copy();
+                badAmount.putByteArray("amount",
+                        java.math.BigInteger.valueOf(-5).toByteArray());
+                entries.add(badAmount);
+                cpu.loadTag(broken); // ここで例外が出たらテストごと落ちる = 検出できる
+                helper.check(overLong.equals(cpu.getPendingOutputs().get(log)),
+                        "壊れたエントリ混在で正常なエントリまで壊れた: " + cpu.getPendingOutputs().get(log));
+                helper.check(cpu.getPendingOutputs().size() == 1,
+                        "壊れたエントリが捨てられていない: " + cpu.getPendingOutputs());
+
+                // 4) 旧 long 形式から移行できる
+                var legacy = new net.minecraft.nbt.CompoundTag();
+                cpu.saveAdditional(legacy);
+                legacy.remove("pendingOutputsBig");
+                var legacyList = new net.minecraft.nbt.ListTag();
+                legacyList.add(appeng.api.stacks.GenericStack.writeTag(
+                        new appeng.api.stacks.GenericStack(log, 123_456_789L)));
+                legacy.put("pendingOutputs", legacyList);
+                cpu.loadTag(legacy);
+                helper.check(java.math.BigInteger.valueOf(123_456_789L)
+                                .equals(cpu.getPendingOutputs().get(log)),
+                        "旧形式の移行に失敗: " + cpu.getPendingOutputs().get(log));
+
+                // 5) の準備: long 超の量に戻す
+                cpu.loadTag(tag);
+            });
+
+            // serverTick が走る (このネットワークにはストレージが無いので 1 個も入らない)
+            sequence.thenIdle(2);
+
+            sequence.thenExecute(() -> {
+                var cpu = (QuantumCpuBlockEntity) helper.getBlockEntity(new BlockPos(1, 0, 0));
+                var grid = helper.getGrid(BlockPos.ZERO);
+                long stored = grid.getStorageService().getInventory()
+                        .getAvailableStacks().get(log);
+                // 入ったぶん + 台帳の残り = 元の量 (1 個も消えていない)
+                var pending = cpu.getPendingOutputs().getOrDefault(log, java.math.BigInteger.ZERO);
+                var total = pending.add(java.math.BigInteger.valueOf(stored));
+                helper.check(overLong.equals(total),
+                        "serverTick 後に量が合わない: 台帳 " + pending + " + ME " + stored);
+            });
+
+            sequence.thenSucceed();
+        });
+    }
+
+    /**
      * まとめクラフトが<b>材料以上に作らない</b>ことを確かめる (増殖の回帰テスト)。
      *
      * <p>{@code QuantumBulkCrafting.extractInputs} は在庫が足りなければ<b>黙って回数を減らす</b>。
@@ -416,6 +627,148 @@ public final class InsaneAETestPlots {
                 helper.check(planks == (long) logsInStock * planksPerCraft,
                         "完成待ちの数が材料と釣り合っていない: " + planks + " 枚 (材料は "
                                 + logsInStock + " 本 = " + logsInStock * planksPerCraft + " 枚ぶん)");
+            });
+
+            sequence.thenSucceed();
+        });
+    }
+
+    /**
+     * long あふれの門番: 材料合計が long で表現できない要求が、<b>黙って負の量を流さず</b>
+     * 綺麗に失敗する (craft 可能な計画に化けない) ことを確かめる。
+     *
+     * <p>入れ子 8^21 = 2^63 がちょうど long を超える。AE2 の
+     * {@code CraftingTreeProcess.request} は「材料数 × times」をガード無しで掛けるので、
+     * まとめ計算がこの規模を現実に計算可能にした結果、そこが最初に溢れる
+     * (報告: @syarukasu さん)。門番は {@code CraftBranchFailure} で枝を落とすため、
+     * 計算は「失敗またはシミュレーション」で終わり、負の量が計画に載ることは無い。</p>
+     *
+     * <p>検証するのは<b>単一パターンの一括計算</b> (times が一度に来る) — 8^21 の入れ子が
+     * 実際に踏む経路。もう一方の 1 回ずつループ側の門番 (10^18 超の直接発注が必要) は、
+     * シミュレーションが AE2 素の「終わらない 1 回ずつ計算」に落ちる仕様のため
+     * ここでは待てない (実行パスの保護は同じ throw で効いている)。</p>
+     */
+    @TestPlot("insaneae_calc_overflow_guard")
+    public static void calcOverflowGuard(PlotBuilder plot) {
+        plot.creativeEnergyCell("0 -1 0");
+        plot.cable("[0,2] 0 0");
+        plot.blockEntity("1 0 0", AEBlocks.DRIVE, drive -> {
+            drive.getInternalInventory().addItems(CreativeCellItem.ofItems(Items.OAK_LOG));
+        });
+        plot.block("2 0 0", AEBlocks.PATTERN_PROVIDER);
+
+        plot.test(helper -> {
+            var state = new Object() {
+                Future<ICraftingPlan> pending;
+            };
+            var sequence = helper.startSequence();
+
+            sequence.thenExecute(() -> {
+                var provider = (PatternProviderBlockEntity) helper.getBlockEntity(new BlockPos(2, 0, 0));
+                // 丸太 9 → ダイヤ 1 (加工パターン): 単一パターンの一括計算経路。
+                provider.getLogic().getPatternInv().addItems(
+                        processingPattern(Items.OAK_LOG, 9, Items.DIAMOND, 1));
+            });
+
+            // ダイヤ × (Long.MAX/4): 材料は × 9 なので合計が long を超える。
+            sequence.thenExecuteAfter(1, () -> state.pending = beginCalculation(helper,
+                    AEItemKey.of(Items.DIAMOND), Long.MAX_VALUE / 4));
+            sequence.thenWaitUntil(() -> checkOverflowRejected(helper, state.pending, "ダイヤ"));
+
+            sequence.thenSucceed();
+        });
+    }
+
+    /**
+     * 溢れる要求の正解は「作成不可のシミュレーション計画」ただ一つ。
+     *
+     * <ul>
+     *   <li>craft 可能な計画 → 不合格 (負の量が載っている可能性)</li>
+     *   <li>null や例外 → 不合格 (プランが null だと提出側の
+     *       {@code result.simulation()} が NPE になる。実機で発生した回帰)</li>
+     * </ul>
+     */
+    private static void checkOverflowRejected(appeng.server.testworld.PlotTestHelper helper,
+            Future<ICraftingPlan> pending, String label) {
+        if (!pending.isDone()) {
+            throw new GameTestAssertException(label + " の計算がまだ終わっていない");
+        }
+        try {
+            ICraftingPlan plan = pending.get();
+            helper.check(plan != null,
+                    label + ": 計画が null (提出画面が NPE になる)");
+            helper.check(plan.simulation(),
+                    label + ": 溢れる要求が craft 可能な計画になった (負の量が載っている可能性)");
+        } catch (ExecutionException e) {
+            throw new GameTestAssertException(label + " の計算が例外で終わった: " + e.getCause());
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * タスク統合カード: まとめ 1 回がクラスタ予算を <b>1 操作</b>しか消費しないことを確かめる。
+     *
+     * <p>クラスタ予算 3 に対して 1000 回の要求を流す。カード無しなら 3 回で頭打ちになるところが、
+     * カード有りなら 1000 回まるごと 1 tick で通り、消費した操作数は 1 と報告される
+     * (回数の上限はクラスタではなく Quantum CPU 自身の予算 = 加速カード 1 枚で 65536/tick)。</p>
+     */
+    @TestPlot("insaneae_task_fusion_card")
+    public static void taskFusionCard(PlotBuilder plot) {
+        plot.creativeEnergyCell("0 -1 0");
+        plot.cable("[0,2] 0 0");
+        plot.blockState("2 0 0", ModBlocks.QUANTUM_CPU.get().defaultBlockState());
+
+        final long requested = 1000;
+        final int clusterBudget = 3;
+        final int planksPerCraft = 4;
+
+        plot.test(helper -> {
+            var state = new Object() {
+                FakeJobView view;
+                int ops;
+            };
+            var sequence = helper.startSequence();
+
+            sequence.thenExecute(() -> {
+                var cpu = (QuantumCpuBlockEntity) helper.getBlockEntity(new BlockPos(2, 0, 0));
+                cpu.getLogic().getPatternInv().addItems(
+                        CraftingPatternHelper.encodeShapelessCraftingRecipe(helper.getLevel(),
+                                new ItemStack(Items.OAK_LOG)));
+                cpu.getUpgrades().addItems(new ItemStack(ModUpgrades.TASK_FUSION_CARD.get()));
+                cpu.getUpgrades().addItems(new ItemStack(ModUpgrades.QUANTUM_ACCELERATION_CARD.get()));
+            });
+
+            // パターンの読み直しとクラフト索引の更新待ち (bulk_conservation と同じ)。
+            sequence.thenIdle(5);
+
+            sequence.thenExecute(() -> {
+                var cpu = (QuantumCpuBlockEntity) helper.getBlockEntity(new BlockPos(2, 0, 0));
+                helper.check(cpu.isTaskFusionInstalled(), "タスク統合カードが認識されていない");
+                var patterns = cpu.getLogic().getAvailablePatterns();
+                helper.check(patterns.size() == 1,
+                        "Quantum CPU がパターンを 1 枚だけ持っている状態にならなかった: " + patterns.size());
+
+                var grid = helper.getGrid(BlockPos.ZERO);
+                state.view = new FakeJobView(patterns.get(0), requested);
+                state.view.inventory.insert(AEItemKey.of(Items.OAK_LOG), requested,
+                        appeng.api.config.Actionable.MODULATE);
+
+                state.ops = jp.main.taikun.insaneae.quantum.QuantumBulkCrafting.execute(
+                        state.view, clusterBudget,
+                        (appeng.me.service.CraftingService) grid.getCraftingService(),
+                        grid.getEnergyService(), grid.getPivot().getLevel());
+            });
+
+            sequence.thenExecute(() -> {
+                helper.check(state.ops == 1,
+                        "まとめ 1 回が 1 操作として数えられていない: " + state.ops);
+                helper.check(state.view.remaining == 0,
+                        "予算 " + clusterBudget + " でも全" + requested + "回通るはずが残り "
+                                + state.view.remaining);
+                long planks = state.view.waitingFor.list.get(AEItemKey.of(Items.OAK_PLANKS));
+                helper.check(planks == requested * planksPerCraft,
+                        "完成待ちの数が要求と釣り合っていない: " + planks);
             });
 
             sequence.thenSucceed();
