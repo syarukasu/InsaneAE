@@ -67,7 +67,6 @@ AE2 のバージョン範囲は実際に検証した `[19.2.17,20)` に固定し
 |---|---|
 | `./gradlew runClient` / `runServer` | 開発環境で起動 |
 | `./gradlew runData` | `src/generated/resources` の再生成 |
-| `./gradlew runGameTestServer` | AE2 のテストプロットに相乗りした検証を実行 |
 
 ## 開発メモ
 

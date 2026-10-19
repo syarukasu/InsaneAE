@@ -38,24 +38,14 @@ neoForge {
     runs {
         client {
             client()
-            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
         }
 
         server {
             server()
             programArgument '--nogui'
-            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
         }
 
         // 登録済みの GameTest を全部走らせて終了する。
-        gameTestServer {
-            type = 'gameTestServer'
-            // AE2 のテストプロット基盤に相乗りしているので ae2 名前空間も有効にする
-            // (自前のプロットも ae2.<plot id> という名前で走る)。
-            systemProperty 'neoforge.enabledGameTestNamespaces', "${project.mod_id},ae2"
-            // これが無いと AE2 はプロットを GameTest として登録しない。
-            systemProperty 'appeng.tests', 'true'
-        }
 
         data {
             data()
