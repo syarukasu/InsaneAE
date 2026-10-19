@@ -19,6 +19,10 @@ on:
         type: choice
         options: [release, beta, alpha]
         default: release
+      release_notes:
+        description: 'Release notes for this version'
+        type: string
+        required: true
       targets:
         description: '対象'
         type: choice
@@ -86,16 +90,9 @@ jobs:
           version=$(grep -E '^mod_version=' gradle.properties | cut -d= -f2)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-          # CHANGELOG.md の「先頭のバージョン節」だけを抜き出す。
-          # 見出しが version と食い違っていたら、書き忘れとみなして止める。
-          head=$(grep -m1 -E '^## ' CHANGELOG.md | sed -E 's/^## +//')
-          if [ "$head" != "$version" ]; then
-            echo "::error::CHANGELOG.md の先頭が '$head' ですが mod_version は '$version' です"
-            exit 1
-          fi
-          awk '/^## /{ if (seen) exit; seen=1; next } seen' CHANGELOG.md > changelog.md
-          echo "--- changelog ---"
-          cat changelog.md
+          printf '%s\n' "$RELEASE_NOTES" > changelog.md
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes }}
 
       - run: chmod +x ./gradlew
         if: steps.want.outputs.want == 'yes'
@@ -103,34 +100,6 @@ jobs:
       - name: Build
         if: steps.want.outputs.want == 'yes'
         run: ./gradlew build
-
-      # build.yml と同じ判定。リリースする物が既知の失敗以外で落ちていないかを見る。
-      - name: Game tests
-        if: steps.want.outputs.want == 'yes'
-        run: |
-          mkdir -p run
-          echo "eula=true" > run/eula.txt
-          ./gradlew runGameTestServer 2>&1 | tee gametest.log || true
-
-          if ! grep -qE 'required tests (passed|failed)' gametest.log; then
-            echo "::error::テストが実行されていません (サーバーが起動途中で落ちた可能性)"
-            exit 1
-          fi
-          grep -oE 'LogTestReporter\]: [a-z0-9_.]+ failed!' gametest.log \
-            | sed -E 's/.*\]: //; s/ failed!$//' | sort -u > actual-failures.txt
-          sed -E 's/#.*//; s/[[:space:]]+//g' .github/known-test-failures.txt \
-            | grep -vE '^$' | sort -u > expected-failures.txt
-          # build.yml と同じ判定。新しく落ちたテストがあるときだけ止める
-          # (AE2 本体には環境で結果が変わるテストがあるため、完全一致では判定しない)。
-          echo "--- 落ちたテスト ---"
-          cat actual-failures.txt
-          comm -13 expected-failures.txt actual-failures.txt > new-failures.txt
-          if [ -s new-failures.txt ]; then
-            echo "::error::新たに落ちたテストがあります。リリースを中止します:"
-            cat new-failures.txt
-            exit 1
-          fi
-          echo "新規の失敗はありません。"
 
       - name: jar を特定する
         if: steps.want.outputs.want == 'yes'
@@ -236,7 +205,6 @@ jobs:
           name: logs-${{ matrix.branch }}
           path: |
             run/logs/
-            gametest.log
           if-no-files-found: ignore
 
   # 両方のビルドが通ってから、jar をまとめて GitHub Release に出す。
@@ -257,7 +225,9 @@ jobs:
         run: |
           version=$(grep -E '^mod_version=' gradle.properties | cut -d= -f2)
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          awk '/^## /{ if (seen) exit; seen=1; next } seen' CHANGELOG.md > changelog.md
+          printf '%s\n' "$RELEASE_NOTES" > changelog.md
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes }}
 
       - uses: actions/download-artifact@v4
         with:
